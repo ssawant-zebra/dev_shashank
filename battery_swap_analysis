@@ -1,0 +1,403 @@
+ create or replace TEMP table `site_data` as ( select  distinct serial_number,master_id,slot_date,site_name,from
+(Select serial_number, master_id,slot_date,site_name,
+ROW_NUMBER() OVER(PARTITION BY serial_number, slot_date ORDER BY site_name) AS first_created
+-- FROM `gms-ds-algorithms-sb.looker_data_modelling_eu.serial_number_master_id_mapping`
+from `viq-st-eu-p.viq_operation.t_device_store_carry_forward_history`
+ where slot_date between  "2024-05-01" and  "2024-05-31"  and master_id=96487 
+ )where first_created = 1);
+
+create or replace TEMP table `battery_data` as (
+Select *,
+case
+when batt_swap = "Testing-charge" and  device_hour between 6 and 8  THEN 'Testing-Charge during 6-8AM'
+when batt_swap = "Testing-charge"  and device_hour not in( 6,7,8) THEN 'Testing-Charge exluding 6-8AM'
+when batt_swap = "Inappropriate swap" and  device_hour between 8 and 16 THEN 'Inappropriate swap during primary shift(8AM-4PM)'
+when batt_swap = "Inappropriate swap" and device_hour not in (9,10,11,12,13,14,15,16) THEN 'Inappropriate swap during non primary shift(excluding 8AM-4PM)'
+else
+batt_swap
+end as batt_swap2
+from(
+select * ,
+CASE
+      WHEN (batt_chng  = 1
+        and prev_battery_level >89 )   THEN 'Testing-Charge'
+      WHEN (batt_chng  = 1
+        and prev_battery_level between 15 and 89 )   THEN 'Inappropriate swap'
+      WHEN (batt_chng  = 1
+        and prev_battery_level < 15  )   THEN 'Appropriate swap'
+    ELSE
+     'No swap'
+    END AS batt_swap
+from (
+select serialnumber,bid,device_date,device_hour,device_min,battery_level,ac_line_status,last_battery_val, 
+ (LAG(serialnumber)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_serialnumber,
+  (LAG(bid)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_bid,
+  (LAG(device_date)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_device_date,
+  (LAG(device_hour)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_device_hour,
+  (LAG(device_min)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_device_min,
+  (LAG(ac_line_status)  over (order by serialnumber,device_date,device_hour,device_min,bid) ) as  prev_ac_line_status,
+   (LAG(battery_level)  over (order by serialnumber,device_date,device_hour,device_min) ) as  prev_battery_level,
+   CASE
+      WHEN (bid  != (LAG(bid)  over (order by serialnumber,device_date,device_hour,device_min) )
+        and serialnumber = (LAG(serialnumber)  over (order by serialnumber,device_date,device_hour,device_min) ) )  THEN 1
+    ELSE
+     0
+    END AS batt_chng
+
+   from (
+    select distinct serialnumber,bid,device_date,device_hour,device_min,battery_level,ac_line_status,	last_battery_val from (
+SELECT
+    _e AS serialnumber,CONCAT(battery_partnumber, battery_manufacturing_date, battery_serial_number) AS bid,
+    extract(date from TIMESTAMP_MILLIS(_r)) AS device_date,
+    extract(hour from TIMESTAMP_MILLIS(_r)) as device_hour,
+    extract(minute from TIMESTAMP_MILLIS(_r)) as device_min,
+    battery_level,ac_line_status,
+    safe_CAST(battery_manufacturing_date AS DATE)  as battery_manufacturing_date,
+    COUNT(DISTINCT(_e)) OVER(PARTITION BY EXTRACT(date FROM TIMESTAMP_MILLIS(_r))) AS total_sn_cnt,
+    last_value(battery_level) over (partition by _e,extract(date from TIMESTAMP_MILLIS(_r)),extract(hour from TIMESTAMP_MILLIS(_r)) order by extract(minute from TIMESTAMP_MILLIS(_r)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_battery_val,
+    (battery_temperature/10) as battery_temperature,
+    max((battery_temperature/10)) over (partition by _e,extract(date from TIMESTAMP_MILLIS(_r)),extract(hour from TIMESTAMP_MILLIS (_r))  order by extract(minute from TIMESTAMP_MILLIS(_r)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_battery_temp_val  
+    
+  FROM
+    `es-s2dl-core-p.emc_eu.t_zagent_battery`
+  WHERE
+    DATE(_et) between  "2024-05-01" and  "2024-05-31"
+    AND DATE(TIMESTAMP_MILLIS(_r)) BETWEEN  "2024-05-01" and  "2024-05-31"
+    -- and _e in ("21217522506340","21241522503081","21206522509643") 
+    -- and _e not in ("21197522509310")
+    and ac_line_status >=0
+    AND CONCAT(battery_partnumber, battery_manufacturing_date, battery_serial_number) != "UnknownUnknownUnknown"
+  ORDER BY serialnumber,device_date, device_hour ASC) ORDER BY serialnumber,device_date, device_hour,device_min ASC)
+  ORDER BY serialnumber,device_date, device_hour,device_min ASC)
+  ORDER BY serialnumber,device_date, device_hour,device_min ASC)ORDER BY serialnumber,device_date, device_hour,device_min ASC);
+
+create or replace TEMP table `battery_data_site` as (
+  select a.*,b.site_name,b.master_id
+  from battery_data as a inner join site_data as b
+  on a.serialnumber = b.serial_number and a.device_date=b.slot_date
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+ create or replace TEMP table `battery_swap_data_site` as (
+  select * from battery_data_site
+  where batt_swap != 'No swap');
+
+
+create or replace TEMP table `battery_charging_data_site_60` as (
+  select site_name,prev_ac_line_status,prev_device_hour,
+    round(sum(num_devices)/count(*),0) as avg_devices_on_charge,sum(num_devices) as total_devices_on_charge ,
+    avg(total_sn_cnt) as total_devices,0.6*(avg(total_sn_cnt)) as threshold
+     from (
+  SELECT site_name,prev_ac_line_status,prev_device_date,prev_device_hour,avg(total_sn_cnt) as total_sn_cnt,
+  count( distinct serialnumber) as num_devices from 
+  (select *,COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name) AS total_sn_cnt  
+  from battery_data_site )
+  where prev_ac_line_status = 1 
+  group by site_name,prev_ac_line_status,prev_device_date,prev_device_hour
+  order by site_name,prev_ac_line_status,prev_device_date,prev_device_hour)
+  group by site_name,prev_ac_line_status,prev_device_hour
+order by site_name,prev_ac_line_status,prev_device_hour);
+
+create or replace TEMP table `battery_charging_data_site_50` as (
+  select site_name,prev_ac_line_status,prev_device_hour,
+    round(sum(num_devices)/count(*),0) as avg_devices_on_charge,sum(num_devices) as total_devices_on_charge ,
+    avg(total_sn_cnt) as total_devices,0.5*(avg(total_sn_cnt)) as threshold
+     from (
+  SELECT site_name,prev_ac_line_status,prev_device_date,prev_device_hour,avg(total_sn_cnt) as total_sn_cnt,
+  count( distinct serialnumber) as num_devices from 
+  (select *,COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name) AS total_sn_cnt  
+  from battery_data_site )
+  where prev_ac_line_status = 1 
+  group by site_name,prev_ac_line_status,prev_device_date,prev_device_hour
+  order by site_name,prev_ac_line_status,prev_device_date,prev_device_hour)
+  group by site_name,prev_ac_line_status,prev_device_hour
+order by site_name,prev_ac_line_status,prev_device_hour);
+
+create or replace TEMP table `battery_charging_data_site_40` as (
+  select site_name,prev_ac_line_status,prev_device_hour,
+    round(sum(num_devices)/count(*),0) as avg_devices_on_charge,sum(num_devices) as total_devices_on_charge ,
+    avg(total_sn_cnt) as total_devices,0.4*(avg(total_sn_cnt)) as threshold
+     from (
+  SELECT site_name,prev_ac_line_status,prev_device_date,prev_device_hour,avg(total_sn_cnt) as total_sn_cnt,
+  count( distinct serialnumber) as num_devices from 
+  (select *,COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name) AS total_sn_cnt  
+  from battery_data_site )
+  where prev_ac_line_status = 1 
+  group by site_name,prev_ac_line_status,prev_device_date,prev_device_hour
+  order by site_name,prev_ac_line_status,prev_device_date,prev_device_hour)
+  group by site_name,prev_ac_line_status,prev_device_hour
+order by site_name,prev_ac_line_status,prev_device_hour);
+
+create or replace TEMP table `battery_charging_data_site_30` as (
+  select site_name,prev_ac_line_status,prev_device_hour,
+    round(sum(num_devices)/count(*),0) as avg_devices_on_charge,sum(num_devices) as total_devices_on_charge ,
+    avg(total_sn_cnt) as total_devices,0.3*(avg(total_sn_cnt)) as threshold
+     from (
+  SELECT site_name,prev_ac_line_status,prev_device_date,prev_device_hour,avg(total_sn_cnt) as total_sn_cnt,
+  count( distinct serialnumber) as num_devices from 
+  (select *,COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name) AS total_sn_cnt  
+  from battery_data_site )
+  where prev_ac_line_status = 1 
+  group by site_name,prev_ac_line_status,prev_device_date,prev_device_hour
+  order by site_name,prev_ac_line_status,prev_device_date,prev_device_hour)
+  group by site_name,prev_ac_line_status,prev_device_hour
+order by site_name,prev_ac_line_status,prev_device_hour);
+
+-- Threshold 60 !!!!
+create or replace TEMP table `battery_charging_data_site2_60` as (
+  select * from(
+select *,
+CASE
+      WHEN (avg_devices_on_charge >= threshold)
+         THEN 'Charge_Period'
+      ELSE
+        'Primary_Shift'
+    END AS Charge_Period
+  from `battery_charging_data_site_60`
+  order by site_name,prev_ac_line_status,prev_device_hour)
+  where Charge_Period = "Charge_Period"
+  order by site_name,prev_ac_line_status,prev_device_hour
+);
+
+create or replace TEMP table `comb_data_60` as (
+  select a.*,b.Charge_Period,threshold
+  from battery_data_site as a left join battery_charging_data_site2_60 as b
+  on a.site_name = b.site_name and a.device_hour=b.prev_device_hour
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+ create or replace TEMP table `comb_data1_60` as (
+  select *,
+  CASE
+    WHEN Charge_Period = "Charge_Period"  THEN 'Testing_Charge_during_Charging_Period'
+    ELSE
+    batt_swap
+    END AS batt_swap3
+  from comb_data_60
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+create or replace TEMP table `swap_may24_60` as (
+select *,format_date('%Y-%b', device_date) as year_month,'60' as threshold_filter
+ from comb_data1_60
+ where batt_swap != "No swap"
+order by serialnumber,device_date, device_hour,device_min ASC);
+
+-- !!!!!!THRESHOLD 50 !!!!!!!!
+
+create or replace TEMP table `battery_charging_data_site2_50` as (
+  select * from(
+select *,
+CASE
+      WHEN (avg_devices_on_charge >= threshold)
+         THEN 'Charge_Period'
+      ELSE
+        'Primary_Shift'
+    END AS Charge_Period
+  from `battery_charging_data_site_50`
+  order by site_name,prev_ac_line_status,prev_device_hour)
+  where Charge_Period = "Charge_Period"
+  order by site_name,prev_ac_line_status,prev_device_hour
+);
+
+create or replace TEMP table `comb_data_50` as (
+  select a.*,b.Charge_Period,threshold
+  from battery_data_site as a left join battery_charging_data_site2_50 as b
+  on a.site_name = b.site_name and a.device_hour=b.prev_device_hour
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+ create or replace TEMP table `comb_data1_50` as (
+  select *,
+  CASE
+    WHEN Charge_Period = "Charge_Period"  THEN 'Testing_Charge_during_Charging_Period'
+    ELSE
+    batt_swap
+    END AS batt_swap3
+  from comb_data_50
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+create or replace TEMP table `swap_may24_50` as (
+select *,format_date('%Y-%b', device_date) as year_month,'50' as threshold_filter
+ from comb_data1_50
+ where batt_swap != "No swap"
+order by serialnumber,device_date, device_hour,device_min ASC);
+
+-- !!!!THRSHOLD 40!!!!!!!
+create or replace TEMP table `battery_charging_data_site2_40` as (
+  select * from(
+select *,
+CASE
+      WHEN (avg_devices_on_charge >= threshold)
+         THEN 'Charge_Period'
+      ELSE
+        'Primary_Shift'
+    END AS Charge_Period
+  from `battery_charging_data_site_40`
+  order by site_name,prev_ac_line_status,prev_device_hour)
+  where Charge_Period = "Charge_Period"
+  order by site_name,prev_ac_line_status,prev_device_hour
+);
+
+create or replace TEMP table `comb_data_40` as (
+  select a.*,b.Charge_Period,threshold
+  from battery_data_site as a left join battery_charging_data_site2_40 as b
+  on a.site_name = b.site_name and a.device_hour=b.prev_device_hour
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+ create or replace TEMP table `comb_data1_40` as (
+  select *,
+  CASE
+    WHEN Charge_Period = "Charge_Period"  THEN 'Testing_Charge_during_Charging_Period'
+    ELSE
+    batt_swap
+    END AS batt_swap3
+  from comb_data_40
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+create or replace TEMP table `swap_may24_40` as (
+select *,format_date('%Y-%b', device_date) as year_month,'40' as threshold_filter
+ from comb_data1_40
+ where batt_swap != "No swap"
+order by threshold_filter,serialnumber,device_date, device_hour,device_min ASC);
+
+-- Threshold 30 !!!!
+create or replace TEMP table `battery_charging_data_site2_30` as (
+  select * from(
+select *,
+CASE
+      WHEN (avg_devices_on_charge >= threshold)
+         THEN 'Charge_Period'
+      ELSE
+        'Primary_Shift'
+    END AS Charge_Period
+  from `battery_charging_data_site_30`
+  order by site_name,prev_ac_line_status,prev_device_hour)
+  where Charge_Period = "Charge_Period"
+  order by site_name,prev_ac_line_status,prev_device_hour
+);
+
+create or replace TEMP table `comb_data_30` as (
+  select a.*,b.Charge_Period,threshold
+  from battery_data_site as a left join battery_charging_data_site2_30 as b
+  on a.site_name = b.site_name and a.device_hour=b.prev_device_hour
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+ create or replace TEMP table `comb_data1_30` as (
+  select *,
+  CASE
+    WHEN Charge_Period = "Charge_Period"  THEN 'Testing_Charge_during_Charging_Period'
+    ELSE
+    batt_swap
+    END AS batt_swap3
+  from comb_data_30
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+create or replace TEMP table `swap_may24_30` as (
+select *,format_date('%Y-%b', device_date) as year_month,'30' as threshold_filter
+ from comb_data1_30
+ where batt_swap != "No swap"
+order by serialnumber,device_date, device_hour,device_min ASC);
+-- END of THRESHOLD 
+
+-- Append Threshold tables
+
+
+-- create or replace table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_may24_with_threshold` as (
+-- select *
+-- FROM `swap_may24_60`  
+-- UNION ALL
+-- select *
+-- FROM `swap_may24_50`  
+-- UNION ALL
+-- select *
+-- FROM `swap_may24_40` 
+-- UNION ALL
+-- select *
+-- FROM `swap_may24_30` 
+-- );
+
+-- create or replace TEMP table `swap_24hrs` as (
+-- select * from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_may24_with_threshold` );
+
+create or replace TEMP table `swap_24hrs` as (
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_jan24_with_threshold` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_feb24_with_threshold` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_mar24_with_threshold` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_apr24_with_threshold` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_may24_with_threshold` where batt_swap != "No swap"
+
+);
+
+create or replace TEMP table `swap_recommendation_threshold` as (
+    select site_name,year_month,threshold_filter,
+    coalesce("Average inappropriate swap per day :" || avg_inappropriate_swaps_per_day) as Comment1,
+    coalesce("Total inappropriate swap:" || total_swaps) as Comment2 from (
+   select site_name,year_month,threshold_filter,round(avg(num_swaps),0) as avg_inappropriate_swaps_per_day,sum(num_swaps) as total_swaps from (
+   select site_name,year_month,threshold_filter,device_date,
+          count(*) as num_swaps from `swap_24hrs` 
+   where  batt_swap3 = "Inappropriate swap"
+   group by site_name,year_month,threshold_filter,device_date)
+   group by site_name,year_month,threshold_filter)order by site_name,year_month,threshold_filter);
+
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_24hrs` as (
+select a.*, b.Comment1,b.Comment2
+from `swap_24hrs` as a left join
+`swap_recommendation_threshold` as b
+on a.site_name=b.site_name and
+a.year_month = b.year_month and a.threshold_filter=b.threshold_filter
+order by site_name,year_month,threshold_filter);
+
+-- -- -- !!!!!!TREND DATA!!!!!!
+
+
+create or replace TEMP table `cte` as (
+select site_name,year_month1,threshold_filter,count(*) as inapp_swap from ( 
+select *,format_date('%Y-%m', device_date) as year_month1 from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_24hrs` )
+where batt_swap3 = "Inappropriate swap"  
+-- and site_name = "240-Chester DO"
+group by site_name,year_month1,threshold_filter
+order by site_name,year_month1,threshold_filter);
+
+create or replace TEMP table `cte1` as (  
+     select * from (select *, 
+                   row_number() 
+                     over(partition by site_name,threshold_filter order by year_month1 ) rn from cte));
+
+
+
+create or replace TEMP table `cte2` as (select c1.site_name, 
+       c1.year_month1,c1.threshold_filter,
+       c1.inapp_swap, sum(c1.inapp_swap) OVER(PARTITION BY c1.site_name) AS total_inapp_swap,
+       case when c1.inapp_swap > c2.inapp_swap then 'up'
+            when c1.inapp_swap < c2.inapp_swap then 'down'
+            when c1.inapp_swap = c2.inapp_swap then 'equal'
+       end as Trend
+from cte1 c1
+left join cte1 c2 on c1.site_name = c2.site_name and c1.threshold_filter = c2.threshold_filter and c1.rn-1 = c2.rn
+order by site_name,threshold_filter);
+
+create or replace TEMP table `cte3` as (select *, '1' as trend_flag from 
+(select site_name,threshold_filter,max(total_inapp_swap) as total_inapp_swap, count(*) as ctrend from cte2
+where Trend in ('up') group by site_name,threshold_filter) where ctrend >=4 );
+
+create or replace table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.swap_trend_24hrs_threshold` as (select c1.*,c2.trend_flag
+from cte2 as c1 inner join cte3 as c2 
+on c1.site_name = c2.site_name and c1.threshold_filter=c2.threshold_filter
+order by total_inapp_swap desc,year_month1,threshold_filter)
+
+
